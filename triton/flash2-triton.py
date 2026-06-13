@@ -27,8 +27,8 @@ def fwd_pass_inner(
     else:
         low,high=0,SEQ_LEN
     
-    K_blk_ptr = tl.advance(K_blk_ptr, (0, lo))
-    V_blk_ptr = tl.advance(V_blk_ptr, (lo, 0)) 
+    K_blk_ptr = tl.advance(K_blk_ptr, (0, low))
+    V_blk_ptr = tl.advance(V_blk_ptr, (low, 0)) 
 
     for kv_start in range(low,high,BLOCK_SIZE_KV):
         kv_start=tl.multiple_of(kv_start,BLOCK_SIZE_KV)
@@ -179,3 +179,113 @@ def fwd_pass(
     m_ptrs=M+batch_head_index*SEQ_LEN+offs_q
     tl.store(m_ptrs,m)
     tl.store(O_blk_ptr,O_blk.to(O.type.element_ty))
+
+@triton.jit
+def bwd_pass_pre(
+    O,
+    dO,
+    D,
+    SEQ_LEN,
+    BLOCK_SIZE_Q: tl.constexpr,
+    HEAD_DIM: tl.constexpr,):
+
+    blk_index_Q = tl.program_id(0)
+    offs_q = blk_index_Q* BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    batch_head_index = tl.program_id(1)
+    offs_dim = tl.arange(0, HEAD_DIM)
+    O_block = tl.load(
+        O
+        + batch_head_index * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM
+        + offs_dim[None, :]
+    )
+    dO_blk = tl.load(
+        dO
+        + batch_head_index * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM
+        + offs_dim[None, :]
+    ).to(tl.float32)  
+    
+    D_blk = tl.sum(dO_blk * O_block, axis=1)
+    D_blk_ptrs = D + batch_head_index * SEQ_LEN + offs_q
+    tl.store(D_blk_ptrs, D_blk)
+
+@triton.jit
+def bwd_pass_dq(
+    Q,
+    K,
+    V,
+    softmax_scaling,
+    dO,
+    dQ,
+    dK,
+    dV,
+    M,
+    D,
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    NUM_HEADS,
+    SEQ_LEN,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    mode: tl.constexpr,):
+
+    batch_head_index = tl.program_id(2)
+    batch_index = batch_head_index // NUM_HEADS
+    head_index = batch_head_index % NUM_HEADS
+    offs_batch_head = (stride_batch * batch_index + stride_head * head_index).to(
+        tl.int64
+    )    
+    offs_batch_head_seq = (batch_head_index * SEQ_LEN).to(tl.int64)
+    Q += offs_batch_head
+    K += offs_batch_head
+    V += offs_batch_head
+    dO += offs_batch_head
+    dQ += offs_batch_head
+    dK += offs_batch_head
+    dV += offs_batch_head
+    M += offs_batch_head_seq
+    D += offs_batch_head_seq  
+    offs_dim = tl.arange(0, HEAD_DIM)
+    blk_index = tl.program_id(0)##
+    start_q = blk_index * BLOCK_Q
+    offs_q = start_q + tl.arange(0, BLOCK_Q)
+    Q_blk = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim)
+    dQ_blk = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+    dO_blk = tl.load(
+        dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    )
+
+    M_blk = tl.load(M + offs_q)
+    M_blk = M_blk[:, None]
+    
+    offs_kv = tl.arange(0, BLOCK_KV)
+    kT_ptrs = K + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    vT_ptrs = V + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim    
+    Di = tl.load(D + offs_q)
+    
+    curr_kv = 0
+    num_steps = SEQ_LEN // BLOCK_KV
+    for blk_idx in range(num_steps):
+        K_T_blk = tl.load(kT_ptrs)
+        V_T_blk = tl.load(vT_ptrs)
+        QK_blk = softmax_scaling * tl.dot(Q_blk, K_T_blk)
+        P_blk = tl.math.exp(QK_blk - M_blk)
+            
+        if mode == 3:
+            offs_kv = curr_kv + tl.arange(0, BLOCK_KV)
+            mask_block = offs_q[:, None] >= offs_kv[None, :]
+            P_block = tl.where(mask_block, P_block, 0.0)  
+        dP_block = tl.dot(dO_blk, V_T_blk).to(tl.float32)
+        dS_block = P_block * (dP_block - Di[:, None])
+        dS_block = dS_block.to(tl.float16)  
+        dQ_block += softmax_scaling * tl.dot(dS_block, tl.trans(K_T_blk))        
+        curr_kv += BLOCK_KV
+        kT_ptrs += BLOCK_KV * stride_seq
+        vT_ptrs += BLOCK_KV * stride_seq
+    dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    tl.store(dQ_block_ptrs, dQ_block)        
+
