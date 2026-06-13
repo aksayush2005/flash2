@@ -1,14 +1,6 @@
-# flash2: FlashAttention-2 Implementation
+# FlashAttention-2 Triton Implementation
 
-This repository contains a Triton-based FlashAttention-style implementation, with utility scripts for benchmarking and correctness validation on CUDA GPUs.
-
-The current workspace includes:
-
-- `triton/flash2-triton.py` — Triton attention kernel implementation
-- `triton/benchmark_flash2.py` — benchmark runner for forward/backward performance
-- `triton/check_correctness_flash2.py` — numerical correctness checker against PyTorch
-- `triton/requirements.txt` — Python dependency list
-- `results/` — placeholder directory for generated output or visualizations
+A high-performance FlashAttention-style implementation built with Triton and PyTorch. This repository provides optimized forward and backward attention kernels, benchmarking utilities, and numerical correctness validation against PyTorch reference implementations.
 
 ## Repository Structure
 
@@ -24,107 +16,123 @@ The current workspace includes:
     └── requirements.txt
 ```
 
+## Features
+
+* Triton-based FlashAttention-style forward and backward kernels
+* Custom PyTorch autograd integration
+* Numerical correctness validation against PyTorch reference attention
+* Performance benchmarking with CUDA event timing
+* Support for causal and non-causal attention
+* Configurable batch sizes, sequence lengths, head counts, and head dimensions
+
 ## Requirements
 
-Install the Python dependencies from `triton/requirements.txt`:
+Install dependencies using:
 
 ```bash
 pip install -r triton/requirements.txt
 ```
 
-This project requires:
+### Prerequisites
 
-- Python
-- CUDA-compatible GPU
-- PyTorch
-- Triton
+* Python 3.10+
+* CUDA-compatible GPU
+* PyTorch
+* Triton
 
-## Files
+## Components
 
 ### `triton/flash2-triton.py`
 
-Contains the Triton implementation of the FlashAttention-style forward and backward kernels and the `TritonAttention` autograd wrapper.
+Core implementation containing:
+
+* Forward attention kernel
+* Backward attention kernels
+* Triton kernel launch logic
+* `TritonAttention` autograd wrapper
 
 ### `triton/benchmark_flash2.py`
 
-Performance benchmark script for the Triton kernel. It:
+Benchmarking utility that:
 
-- prints readable terminal tables
-- measures latency using CUDA events
-- reports mean, median, min, max, and estimated TFLOPS
-- compares against PyTorch SDPA when available
-- shows Triton-only results if SDPA benchmarking is unavailable
+* Measures latency using CUDA events
+* Reports mean, median, minimum, and maximum execution times
+* Estimates throughput in TFLOPS
+* Compares against PyTorch Scaled Dot Product Attention (SDPA) when available
+* Falls back to Triton-only benchmarking when SDPA is unavailable
 
 ### `triton/check_correctness_flash2.py`
 
-Numerical correctness checker against a PyTorch reference implementation. It validates:
+Validation script that compares Triton outputs against PyTorch reference implementations for:
 
-- forward output
-- `dQ`
-- `dK`
-- `dV`
+* Forward pass outputs
+* Query gradients (`dQ`)
+* Key gradients (`dK`)
+* Value gradients (`dV`)
 
-Defaults are conservative to fit memory-limited GPUs.
+Default settings are intentionally conservative to accommodate memory-constrained GPUs.
 
 ## Running Benchmarks
+
+Basic benchmark:
 
 ```bash
 python triton/benchmark_flash2.py
 ```
 
-Causal benchmark example:
+Causal attention benchmark:
 
 ```bash
 python triton/benchmark_flash2.py --causal --seq-lens 1024,2048 --head-dims 64
 ```
 
-Larger benchmark example:
+Larger-scale benchmark:
 
 ```bash
 python triton/benchmark_flash2.py --batch 8 --heads 16 --seq-lens 4096 --head-dims 64
 ```
 
-## Running Correctness Checks
+## Running Correctness Validation
+
+Default validation:
 
 ```bash
 python triton/check_correctness_flash2.py
 ```
 
-Safer minimal run:
+Minimal validation configuration:
 
 ```bash
 python triton/check_correctness_flash2.py --batch 1 --heads 1 --seq-lens 128 --head-dims 64
 ```
 
-Extended correctness sweep:
+Extended validation sweep:
 
 ```bash
 python triton/check_correctness_flash2.py --seq-lens 128,256,512 --head-dims 64 --causal-modes false,true
 ```
 
-## Kaggle Notes
+## Kaggle Recommendations
 
-For Kaggle or other limited-memory environments:
+For Kaggle or other resource-constrained environments:
 
-- start correctness checks with small sequence lengths such as `128` or `256`
-- avoid running dense PyTorch reference attention at very large sequence lengths
-- benchmark Triton separately from correctness checks
-- expect some GPU-dependent Triton autotuning differences
+* Begin with sequence lengths of `128` or `256`
+* Run correctness checks before large-scale benchmarks
+* Avoid dense PyTorch reference attention for very large sequence lengths
+* Benchmark Triton kernels independently when GPU memory is limited
+* Expect minor autotuning differences across GPU architectures
 
-Recommended order on Kaggle:
+Recommended workflow:
 
 1. Install dependencies
-2. Run `check_correctness_flash2.py` on small shapes
-3. Run `benchmark_flash2.py` on target benchmark shapes
+2. Run correctness validation on small problem sizes
+3. Benchmark on target sequence lengths and head dimensions
 
-## Output Placeholders
+## Results
 
-Add benchmark or correctness visuals to `results/` later, for example:
+Benchmark outputs, performance analyses, and validation results can be found in the `results/` directory.
 
-```markdown
-![Benchmark Output](results/benchmark.png)
-```
+## License
 
-```markdown
-![Correctness Output](results/correctness.png)
-```
+This project is provided for research, experimentation, and educational purposes.
+
