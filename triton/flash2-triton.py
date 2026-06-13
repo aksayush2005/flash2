@@ -197,8 +197,8 @@ def fwd_pass(
 @triton.autotune(
     [
         triton.Config({}, num_stages=num_stages, num_warps=num_warps)
-        for num_stages in [2, 3, 4, 5]
-        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3]
+        for num_warps in [2, 4]
     ],
     key=["SEQ_LEN", "HEAD_DIM"],
 )
@@ -235,8 +235,8 @@ def bwd_pass_pre(
 @triton.autotune(
     [
         triton.Config({}, num_stages=num_stages, num_warps=num_warps)
-        for num_stages in [2, 3, 4, 5]
-        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3]
+        for num_warps in [2, 4]
     ],
     key=["SEQ_LEN", "HEAD_DIM"],
 )
@@ -322,8 +322,8 @@ def bwd_pass_dq(
 @triton.autotune(
     [
         triton.Config({}, num_stages=num_stages, num_warps=num_warps)
-        for num_stages in [2, 3, 4, 5]
-        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3]
+        for num_warps in [2, 4]
     ],
     key=["SEQ_LEN", "HEAD_DIM"],
 )
