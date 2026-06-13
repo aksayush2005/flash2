@@ -1,4 +1,4 @@
-# FlashAttention-2 Triton Implementation
+# flash2: A FlashAttention-2 Triton Implementation
 
 A high-performance FlashAttention-style implementation built with Triton and PyTorch. This repository provides optimized forward and backward attention kernels, benchmarking utilities, and numerical correctness validation against PyTorch reference implementations.
 
@@ -20,7 +20,7 @@ A high-performance FlashAttention-style implementation built with Triton and PyT
 
 * Triton-based FlashAttention-style forward and backward kernels
 * Custom PyTorch autograd integration
-* Numerical correctness validation against PyTorch reference attention
+* Numerical correctness validation against PyTorch reference implementations
 * Performance benchmarking with CUDA event timing
 * Support for causal and non-causal attention
 * Configurable batch sizes, sequence lengths, head counts, and head dimensions
@@ -36,9 +36,22 @@ pip install -r triton/requirements.txt
 ### Prerequisites
 
 * Python 3.10+
-* CUDA-compatible GPU
+* NVIDIA GPU with CUDA support
+* CUDA Toolkit (compatible with your installed PyTorch version)
 * PyTorch
 * Triton
+
+Verify CUDA availability:
+
+```bash
+nvidia-smi
+```
+
+Verify that PyTorch can access the GPU:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
 
 ## Components
 
@@ -127,12 +140,43 @@ Recommended workflow:
 1. Install dependencies
 2. Run correctness validation on small problem sizes
 3. Benchmark on target sequence lengths and head dimensions
-
 ## Results
 
-Benchmark outputs, performance analyses, and validation results can be found in the `results/` directory.
+### Benchmark Results
 
-## License
+![Benchmark Results](results/benchmark.png)
 
-This project is provided for research, experimentation, and educational purposes.
+### Correctness Validation
+
+![Correctness Validation](results/correctness.png)
+
+## Future Work
+
+Planned improvements include:
+
+* Native CUDA implementation alongside the Triton implementation
+* Additional kernel optimizations and autotuning strategies
+* Support for a wider range of attention configurations
+* Extended benchmarking across different GPU architectures
+* Comprehensive performance comparisons between CUDA, Triton, and PyTorch SDPA
+* Improved testing and validation coverage
+* Multi-GPU experimentation and scaling studies
+
+## References
+
+The implementation and understanding of FlashAttention concepts were informed by the following resources:
+
+1. Tri Dao et al., *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*
+2. Tri Dao et al., *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*
+3. Umar Jamil's educational content and implementation walkthroughs on Attention, FlashAttention, and Triton programming
+4. Official Triton Documentation
+5. Official PyTorch Documentation
+
+## Acknowledgements
+
+Special thanks to Tri Dao and the FlashAttention research team for their pioneering work on efficient attention algorithms, and to Umar Jamil for providing accessible educational resources that helped deepen understanding of FlashAttention and Triton kernel development.
+
+## Disclaimer
+
+This repository is an independent educational and research implementation. It is not affiliated with or endorsed by the FlashAttention authors, Triton developers, or any associated organizations.
 
