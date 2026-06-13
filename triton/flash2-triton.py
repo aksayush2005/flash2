@@ -39,10 +39,10 @@ def fwd_pass_inner(
             mask = offs_q[:, None] >= (kv_start + offs_kv[None, :])
             QK_blk = QK_blk * softmax_scaling+ tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m, tl.max(QK_blk, 1))
-            QK_block -= m_ij[:, None]
+            QK_blk -= m_ij[:, None]
         else:
-            m_ij = tl.maximum(m, tl.max(QK_block, 1) * softmax_scaling)
-            QK_block = QK_block * softmax_scaling - m_ij[:, None]              
+            m_ij = tl.maximum(m, tl.max(QK_blk, 1) * softmax_scaling)
+            QK_blk = QK_blk * softmax_scaling - m_ij[:, None]              
 
         
         P_blk = tl.math.exp(QK_blk)
@@ -55,10 +55,24 @@ def fwd_pass_inner(
         O_blk = tl.dot(P_blk, V_blk, O_blk) #O=O+PV
 
         m = m_ij
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+        V_blk_ptr = tl.advance(V_blk_ptr, (BLOCK_SIZE_KV, 0))
+        K_blk_ptr = tl.advance(K_blk_ptr, (0, BLOCK_SIZE_KV))
     return O_blk, l, m
 
+@triton.autotune(
+    [
+        triton.Config(
+            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_SIZE_Q in [64, 128]
+        for BLOCK_SIZE_KV in [32, 64]
+        for num_stages in ([3, 4, 7])
+        for num_warps in [2, 4]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 
 @triton.jit
 def fwd_pass(
@@ -83,7 +97,7 @@ def fwd_pass(
     stride_O_dim,
     BATCH_SIZE,
     NUM_HEADS:tl.constexpr,
-    SEQ_LEN:tl.consexpr,
+    SEQ_LEN:tl.constexpr,
     HEAD_DIM:tl.constexpr,
     BLOCK_SIZE_Q:tl.constexpr,
     BLOCK_SIZE_KV:tl.constexpr,
@@ -158,7 +172,7 @@ def fwd_pass(
             SEQ_LEN,
         )
         if mode == 3:
-            O_blk, l_i, m_i = fwd_pass_inner(
+            O_blk, l, m = fwd_pass_inner(
                 O_blk,
                 l,
                 m,
@@ -180,6 +194,14 @@ def fwd_pass(
     tl.store(m_ptrs,m)
     tl.store(O_blk_ptr,O_blk.to(O.type.element_ty))
 
+@triton.autotune(
+    [
+        triton.Config({}, num_stages=num_stages, num_warps=num_warps)
+        for num_stages in [2, 3, 4, 5]
+        for num_warps in [2, 4, 8]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit
 def bwd_pass_pre(
     O,
@@ -210,6 +232,14 @@ def bwd_pass_pre(
     D_blk_ptrs = D + batch_head_index * SEQ_LEN + offs_q
     tl.store(D_blk_ptrs, D_blk)
 
+@triton.autotune(
+    [
+        triton.Config({}, num_stages=num_stages, num_warps=num_warps)
+        for num_stages in [2, 3, 4, 5]
+        for num_warps in [2, 4, 8]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit
 def bwd_pass_dq(
     Q,
@@ -278,17 +308,25 @@ def bwd_pass_dq(
         if mode == 3:
             offs_kv = curr_kv + tl.arange(0, BLOCK_KV)
             mask_block = offs_q[:, None] >= offs_kv[None, :]
-            P_block = tl.where(mask_block, P_block, 0.0)  
+            P_blk = tl.where(mask_block, P_blk, 0.0)  
         dP_block = tl.dot(dO_blk, V_T_blk).to(tl.float32)
-        dS_block = P_block * (dP_block - Di[:, None])
+        dS_block = P_blk * (dP_block - Di[:, None])
         dS_block = dS_block.to(tl.float16)  
-        dQ_block += softmax_scaling * tl.dot(dS_block, tl.trans(K_T_blk))        
+        dQ_blk += softmax_scaling * tl.dot(dS_block, tl.trans(K_T_blk))        
         curr_kv += BLOCK_KV
         kT_ptrs += BLOCK_KV * stride_seq
         vT_ptrs += BLOCK_KV * stride_seq
     dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
-    tl.store(dQ_block_ptrs, dQ_block)    
+    tl.store(dQ_block_ptrs, dQ_blk)    
 
+@triton.autotune(
+    [
+        triton.Config({}, num_stages=num_stages, num_warps=num_warps)
+        for num_stages in [2, 3, 4, 5]
+        for num_warps in [2, 4, 8]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit
 def bwd_pass_dk_dv(
     Q,
@@ -381,3 +419,192 @@ def bwd_pass_dk_dv(
     dK_block_ptrs = dK + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
     tl.store(dK_block_ptrs, dK_block)    
 
+class TritonAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, Q, K, V, causal, softmax_scaling):
+        HEAD_DIM_Q, HEAD_DIM_K = Q.shape[-1], K.shape[-1]
+        HEAD_DIM_V = V.shape[-1]
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+        O = torch.empty_like(Q)
+        mode = 3 if causal else 1
+
+        grid = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+            BATCH_SIZE * NUM_HEADS,
+            1,
+        )
+        M = torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32
+        )
+
+        fwd_pass[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scaling=softmax_scaling,
+            M=M,
+            O=O,
+            stride_Q_batch=Q.stride(0),
+            stride_Q_head=Q.stride(1),
+            stride_Q_seq=Q.stride(2),
+            stride_Q_dim=Q.stride(3),
+            stride_K_batch=K.stride(0),
+            stride_K_head=K.stride(1),
+            stride_K_seq=K.stride(2),
+            stride_K_dim=K.stride(3),
+            stride_V_batch=V.stride(0),
+            stride_V_head=V.stride(1),
+            stride_V_seq=V.stride(2),
+            stride_V_dim=V.stride(3),
+            stride_O_batch=O.stride(0),
+            stride_O_head=O.stride(1),
+            stride_O_seq=O.stride(2),
+            stride_O_dim=O.stride(3),
+            BATCH_SIZE=Q.shape[0],
+            NUM_HEADS=Q.shape[1],
+            SEQ_LEN=Q.shape[2],
+            HEAD_DIM=HEAD_DIM_K,
+            mode=mode,
+        )
+
+        ctx.save_for_backward(Q, K, V, O, M)
+        ctx.grid = grid
+        ctx.softmax_scale = softmax_scaling
+        ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.causal = causal
+        return O
+
+    @staticmethod
+    def backward(ctx, dO):
+        Q, K, V, O, M = ctx.saved_tensors
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
+        D = torch.empty_like(M)
+
+        bwd_pass_pre[preprocess_grid](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
+            HEAD_DIM=ctx.HEAD_DIM,
+        )
+
+        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
+
+        mode = 3 if ctx.causal else 1
+
+        bwd_pass_dk_dv[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scaling=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_seq=Q.stride(2),
+            stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MICRO,
+            BLOCK_KV=BLOCK_SIZE_MACRO,
+            HEAD_DIM=ctx.HEAD_DIM,
+            mode=mode,
+        )
+
+        bwd_pass_dq[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scaling=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_seq=Q.stride(2),
+            stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MACRO,
+            BLOCK_KV=BLOCK_SIZE_MICRO,
+            HEAD_DIM=ctx.HEAD_DIM,
+            mode=mode,
+        )
+
+        return dQ, dK, dV, None, None
+
+
+#correntness check
+def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
+    Q = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    K = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    V = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+
+    softmax_scale = 1 / (HEAD_DIM**0.5)
+    dO = torch.randn_like(Q)
+
+    MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device="cuda"))
+    P = torch.matmul(Q, K.transpose(2, 3)) * softmax_scale
+    if causal:
+        P[:, :, MASK == 0] = float("-inf")
+    P = torch.softmax(P.float(), dim=-1).half()
+    ref_O = torch.matmul(P, V)
+    ref_O.backward(dO)
+    ref_dV, V.grad = V.grad.clone(), None
+    ref_dK, K.grad = K.grad.clone(), None
+    ref_dQ, Q.grad = Q.grad.clone(), None
+
+    tri_out = TritonAttention.apply(Q, K, V, causal, softmax_scale).half()
+    tri_out.backward(dO)
+    tri_dV, V.grad = V.grad.clone(), None
+    tri_dK, K.grad = K.grad.clone(), None
+    tri_dQ, Q.grad = Q.grad.clone(), None
+
+    rtol = 0.0
+    atol = 1e-2
+    assert torch.allclose(ref_O, tri_out, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
+
+
+if __name__ == "__main__":
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
+    print("PASSED")
